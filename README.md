@@ -66,7 +66,8 @@ typedef struct _KP_FUNC_TABLE {
 [Hook]
 SourceDriver=your_driver.sys    ; 待加载的未签名驱动文件名（需放在 DriverLoader 同目录）
 ExpDriverName=YourExploit.sys   ; 漏洞驱动文件名（需放在 DriverLoader 同目录）
-HookPointRVA=0x1234               ; trampoline 驱动中的 hook 点 RVA（十六进制）
+HookPointRVA=ABCDE              ; trampoline 驱动中的 hook 点 RVA（十六进制）
+Altitude=120000					; minifilter驱动的altitude值
 ```
 
 - **SourceDriver**：你想加载的未签名内核驱动，DriverLoader 会将其代码注入到 trampoline 驱动中运行

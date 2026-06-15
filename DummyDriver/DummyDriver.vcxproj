@@ -134,6 +134,10 @@
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
   <ItemDefinitionGroup>
+     <ClCompile>
+         <DisableSpecificWarnings>4141;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+       </ClCompile>
+    
     <Link>
       <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
