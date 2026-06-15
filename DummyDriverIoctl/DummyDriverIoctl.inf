@@ -1,0 +1,49 @@
+;
+; DummyDriverIoctl.inf -- DeviceIoControl version of DummyDriver
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer=
+CatalogFile=DummyDriverIoctl.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%DummyDriverIoctl.DeviceName%=DummyDriverIoctl_Device, Root\DummyDriverIoctl
+
+[DummyDriverIoctl_Device.NT]
+CopyFiles=DummyDriverIoctl_Files
+
+[DummyDriverIoctl_Files]
+DummyDriverIoctl.sys
+
+[SourceDisksFiles]
+DummyDriverIoctl.sys=1
+
+[DummyDriverIoctl_Device.NT.Services]
+AddService=DummyDriverIoctl, 0x00000002, DummyDriverIoctl_Service
+
+[DummyDriverIoctl_Service]
+DisplayName=%DummyDriverIoctl.SvcDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\DummyDriverIoctl.sys
+
+[Strings]
+ManufacturerName="DummyDriverIoctl"
+ClassName="System"
+DiskName="DummyDriverIoctl Source Disk"
+DummyDriverIoctl.DeviceName="DummyDriverIoctl Device"
+DummyDriverIoctl.SvcDesc="DummyDriverIoctl DeviceIoControl Driver"

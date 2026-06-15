@@ -1,0 +1,3 @@
+[submodule "KernelPower"]
+	path = KernelPower
+	url = ../KernelPower

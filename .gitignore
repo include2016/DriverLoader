@@ -1,0 +1,56 @@
+# Visual Studio intermediate/output files
+x64/
+Debug/
+Release/
+Win32/
+ARM/
+ARM64/
+
+# VS user-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# VS auto-intellisense / database
+.vs/
+*.aps
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# Build outputs
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.log
+*.tlog
+*.lastbuildstate
+*.unsuccessfulbuild
+*.cache
+*.res
+*.exe
+*.dll
+*.sys
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Generated files
+*.i
+*.ii
+*.s
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
