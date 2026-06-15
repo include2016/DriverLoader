@@ -261,6 +261,8 @@ VOID DriverCheck() {
 		err = RegCreateKeyExA(hKey, "Instances", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hInstancesKey, NULL);
 		if (err == ERROR_SUCCESS) {
 			RegSetValueExA(hInstancesKey, NULL, 0, REG_SZ, (BYTE*)default_instance, (DWORD)strlen(default_instance) + 1);
+			// FltMgr queries value named "DEFAULTINSTANCE" (not default value) under Instances key
+			RegSetValueExA(hInstancesKey, "DEFAULTINSTANCE", 0, REG_SZ, (BYTE*)default_instance, (DWORD)strlen(default_instance) + 1);
 			RegCloseKey(hInstancesKey);
 		} else {
 			LDRLog(L"Failed to create Instances subkey for [%S]: 0x%x\n", svc_name, err);
@@ -882,7 +884,7 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 				}
 			}
 		}
-		__debugbreak();
+
 	// Trigger the hooked driver to execute
 	if (!g_kpTable->TriggerExecute()) {
 		LDRLog(L"TriggerExecute failed\n");

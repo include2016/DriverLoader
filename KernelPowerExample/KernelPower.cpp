@@ -11,8 +11,8 @@
 // ──────────────────────────────────────────────────────────────────────────
 //
 // 1. 驱动常量（文件顶部）
-//    - KP_DEVICE_SYMLINK: 驱动的设备符号链接名，如 L"\\\\.\\Hydra"
-//    - KP_IOCTL_CODE:     驱动使用的 IOCTL 控制码，如 0x830020C0
+//    - KP_DEVICE_SYMLINK: 驱动的设备符号链接名，如 L"\\\\.\\KpDevice"
+//    - KP_IOCTL_CODE:     驱动使用的 IOCTL 控制码，如 0x0000ABCD
 //      如果你的驱动使用多个 IOCTL，可以定义多个常量。
 //
 // 2. KpInitialize（导出函数）
@@ -53,14 +53,7 @@
 // DriverLoader 通过 LoadLibrary("KernelPower.dll") 加载，不关心具体
 // 哪个实现，只要导出符号 KpInitialize / KpGetTable / KpCleanup 即可。
 //
-// 【实现参考】
-// ──────────────────────────────────────────────────────────────────────────
-//
-// KernelPower/ 子模块（submodule）包含一个基于 Hydra 驱动的完整实现，
-// 可作为参考。其核心流程：
-//   Read/Write:  IOCTL(allocate MDL) → 映射到用户空间 → memcpy → IOCTL(free MDL)
-//   Trigger:     发送触发 IOCTL 使驱动执行 hook 路径
-//
+
 // ==========================================================================
 
 // ---- TODO: 修改为你的驱动设备符号链接 ----

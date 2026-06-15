@@ -1,0 +1,85 @@
+;
+; DummyDriver.inf — Minifilter driver
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=ActivityMonitor
+ClassGuid={b86dff51-a31e-4bac-b3cf-e8cfe12c2b3b}
+Provider=%ManufacturerName%
+DriverVer=
+CatalogFile=DummyDriver.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+DummyDriver_CopyFiles = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+DummyDriver.sys=1
+
+;
+; --- Default Install ---
+;
+
+[DefaultInstall.NT$ARCH$]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = DummyDriver_CopyFiles
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService = DummyDriver,,DummyDriver_Service
+AddService = FltMgr,,FltMgr_Service
+
+[DefaultUninstall.NT$ARCH$]
+DelFiles   = DummyDriver_CopyFiles
+LegacyUninstall = 1
+
+[DefaultUninstall.NT$ARCH$.Services]
+DelService = DummyDriver
+DelService = FltMgr
+
+;
+; --- Services ---
+;
+
+[DummyDriver_Service]
+DisplayName  = %ServiceDescription%
+ServiceType  = 2               ; SERVICE_FILE_SYSTEM_DRIVER
+StartType    = 3               ; SERVICE_DEMAND_START
+ErrorControl = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\DummyDriver.sys
+AddReg       = DummyDriver_AddRegistry
+Dependencies = FltMgr
+
+[FltMgr_Service]
+DisplayName  = "File System Filter Manager"
+ServiceType  = 2
+StartType    = 3
+ErrorControl = 1
+ServiceBinary = %12%\fltMgr.sys
+
+;
+; --- Registry ---
+;
+
+[DummyDriver_AddRegistry]
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,,"Instance",0x00000000,%DefaultInstance%
+HKR,"Instance\"%DefaultInstance%,,"Altitude",0x00000000,%Altitude%
+HKR,"Instance\"%DefaultInstance%,,"Flags",0x00010001,0x0
+
+;
+; --- Copy Files ---
+;
+
+[DummyDriver_CopyFiles]
+DummyDriver.sys
+
+[Strings]
+ManufacturerName    = "DummyFilter"
+DefaultInstance     = "DummyDriver Instance"
+Altitude            = "370000"
+ServiceDescription  = "Dummy Minifilter Driver"
+DiskName            = "DummyFilter Source Disk"
