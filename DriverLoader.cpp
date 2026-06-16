@@ -17,7 +17,7 @@
 #include <string>
 #include "Helper.h"
 #include "HookSave.h"
-#include "KernelPower/KernelPower.h"
+#include "KernelPower.h"
 
 // Runtime config (read from hookconfig.ini)
 static CHAR g_source_driver[MAX_PATH] = { 0 };
