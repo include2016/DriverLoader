@@ -22,8 +22,8 @@ PVOID LdrCtx_GetTargetDrvBase();
 VOID LdrCtx_SetSourceDrvBase(PVOID base);
 PVOID LdrCtx_GetSourceDrvBase();
 
-VOID LdrCtx_SetPitRelayAddr(PVOID addr);
-PVOID LdrCtx_GetPitRelayAddr();
+VOID LdrCtx_SetDbgPromptAbsAddr(PVOID addr);
+PVOID LdrCtx_GetDbgPromptAbsAddr();
 
 VOID LdrCtx_SetKpTable(const KP_FUNC_TABLE* pTable);
 const KP_FUNC_TABLE* LdrCtx_GetKpTable();

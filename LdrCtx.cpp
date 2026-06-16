@@ -7,7 +7,7 @@ static PVOID trampoline_drv_base;
 static PVOID exp_drv_base;
 static PVOID target_drv_base;
 static PVOID source_drv_base;
-static PVOID pit_relay_addr;
+static PVOID dbg_prompt_abs_addr;
 static const KP_FUNC_TABLE* kp_table = NULL;
 
 DummyHookServices* LdrCtx_GetInterface() {
@@ -56,11 +56,11 @@ PVOID LdrCtx_GetSourceDrvBase() {
 	return source_drv_base;
 }
 
-VOID LdrCtx_SetPitRelayAddr(PVOID addr) {
-	pit_relay_addr = addr;
+VOID LdrCtx_SetDbgPromptAbsAddr(PVOID addr) {
+	dbg_prompt_abs_addr = addr;
 }
-PVOID LdrCtx_GetPitRelayAddr() {
-	return pit_relay_addr;
+PVOID LdrCtx_GetDbgPromptAbsAddr() {
+	return dbg_prompt_abs_addr;
 }
 
 VOID LdrCtx_SetKpTable(const KP_FUNC_TABLE* pTable) {
