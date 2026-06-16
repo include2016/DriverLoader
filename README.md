@@ -101,3 +101,16 @@ msbuild DriverLoader.sln /p:Configuration=Release /p:Platform=x64
 9. TriggerExecute() → 触发漏洞驱动执行 shellcode
 9. KpCleanup()      → 释放资源
 ```
+
+## 效果
+
+加载普通驱动:
+
+https://github.com/user-attachments/assets/a62d1d92-02aa-400f-9943-eacb9d22e8d2
+
+
+加载minifilter驱动:
+
+https://github.com/user-attachments/assets/69a4ffa5-4e6b-4bd7-9783-872551234ad7
+
+
