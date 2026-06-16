@@ -909,7 +909,7 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 				}
 			}
 		}
-		__debugbreak();
+	//	__debugbreak();
 	// Trigger the hooked driver to execute
 	if (!g_kpTable->TriggerExecute()) {
 		LDRLog(L"TriggerExecute failed\n");
