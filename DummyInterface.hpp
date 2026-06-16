@@ -3,7 +3,7 @@
 #include <strsafe.h>
 #include <string>
 #include <vector>
-#include "KernelPower/KernelPower.h"
+#include "KernelPower.h"
 #include "HookServices.h"
 
 // Forward declarations
