@@ -1,6 +1,6 @@
 #pragma once
 #include <Windows.h>
-#include "KernelPower/KernelPower.h"
+#include "KernelPower.h"
 #include "DummyInterface.hpp"
 
 VOID LdrCtx_SetDevHdl(HANDLE handle);
