@@ -10,7 +10,6 @@
 
 // Trampoline stage layout constants
 #define OFFSET_FOR_ORIGINAL_ASM_CODE_SAVE 0x330
-#define TRAMPOLINE_PIT_OFFSET_STAGE_2_FUNC 0x110
 
 // Exploit driver hook point RVA and driver name are read from hookconfig.ini at runtime
 
@@ -28,7 +27,7 @@
 #define stage_0_xoreaxeaxret_size 0x3
 #define stage_0_placeholder_size 0x8
 
-// ntoskrnl DbgPrompt (used as PIT relay when distance > 4GB)
+// ntoskrnl DbgPrompt (used as PIT relay for ff25 indirect jump target)
 #define NTKRNL_NAME "ntoskrnl.exe"
 #define DBG_EXPORT_FUNC "DbgPrompt"
 

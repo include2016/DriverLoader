@@ -36,6 +36,13 @@ BOOL PE_ScanEntryFindSecondCall(
 	_In_ DWORD64 target_kernel_addr,
 	_Out_ DWORD64* out_call_target);
 
+// Find the 2nd CALL instruction in an exported function of a mapped driver image,
+// resolve its target (__security_check_cookie), then overwrite target's first byte with RET (0xC3).
+BOOL PE_PatchExportFuncSecondCall(
+	_In_ ULONG_PTR mapped_base,
+	_In_ const char* driver_path,
+	_In_ const char* func_name);
+
 // Section info for bounds checking
 struct PESectionInfo {
 	CHAR name[9];  // null-terminated section name
@@ -49,14 +56,20 @@ struct PESectionInfo {
 DWORD PE_GetSectionList(const char* driver_path, PESectionInfo* sections, DWORD max_sections);
 
 // Fix all references (both DIR64 relocations and RIP-relative instructions)
-// that point into [old_addr, old_addr+size) to point into [new_addr, new_addr+size) instead.
+// that point into writable section ranges to their remapped addresses.
 // image_base is the virtual address where the mapped image will run in kernel.
 // code_rva/code_size describe the code section to scan for RIP-relative instructions.
+// remap_count/remaps describe the old->new mapping for each remapped writable section.
+struct PESectionRemap {
+	DWORD64 old_addr;
+	DWORD64 old_size;
+	DWORD64 new_addr;
+};
+
 BOOL PE_FixRemappedSectionRefs(
 	_In_ ULONG_PTR Image,
 	_In_ DWORD64 image_base,
 	_In_ DWORD code_rva,
 	_In_ DWORD code_size,
-	_In_ DWORD64 old_addr,
-	_In_ DWORD64 old_size,
-	_In_ DWORD64 new_addr);
+	_In_ const PESectionRemap* remaps,
+	_In_ DWORD remap_count);
