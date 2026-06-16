@@ -5,17 +5,17 @@
 ## 架构
 
 ```
-DriverLoader.exe              主程序，读取配置、加载 KernelPower DLL、执行 hook 流程
-    |
-    +-- KernelPower.dll       可插拔 DLL，封装漏洞驱动的读写/触发原语（需自行实现）
-    |
-    +-- hookconfig.ini        运行时配置（目标驱动名、hook 点 RVA）
+DriverLoader.exe                主程序，读取配置、加载 KernelPower DLL、执行 hook 流程
+    |                           
+    +-- KernelPower.dll         可插拔 DLL，封装漏洞驱动的读写/触发原语（需自行实现）
+    |                           
+    +-- hookconfig.ini          运行时配置（目标驱动名、hook 点 RVA）
     |
     +-- <未签名驱动>.sys        待加载的未签名内核驱动（由 hookconfig.ini 指定）
     |
-    +-- <签名驱动>.sys         已签名驱动，提供代码空间与 trampoline 跳板（由 hookconfig.ini 指定，需放在 DriverLoader 同目录）
+    +-- <签名驱动>.sys          已签名驱动，提供代码空间与 trampoline 跳板（由 hookconfig.ini 指定，需放在 DriverLoader 同目录）
     |
-    +-- hook.save             保存原始代码，用于恢复
+    +-- hook.save               保存原始代码，用于恢复
 ```
 
 DriverLoader 通过 `LoadLibrary("KernelPower.dll")` 加载内核原语 DLL，调用其导出函数获取读写/触发能力，然后在由配置指定的已签名驱动中构建跳板，将未签名驱动的代码注入其中，绕过 DSE（驱动签名强制）加载运行。
