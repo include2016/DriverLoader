@@ -44,6 +44,11 @@ int main(int argc, char* argv[]) {
 
 	LDRLogEtwInit();
 
+	// Copy fltMgr.sys from system32 drivers to current directory (force overwrite)
+	if (!CopyFileW(L"C:\\Windows\\System32\\drivers\\fltMgr.sys", L"fltMgr.sys", FALSE)) {
+		LDRLog(L"Warning: Failed to copy fltMgr.sys (err=0x%x)\n", GetLastError());
+	}
+
 	if (!ReadConfig()) {
 		LDRLog(L"Failed to read config\n");
 		return 1;
@@ -279,22 +284,20 @@ VOID DriverCheck() {
 		DWORD supportedFeatures = 0x3;
 		RegSetValueExA(hKey, "SupportedFeatures", 0, REG_DWORD, (BYTE*)&supportedFeatures, sizeof(DWORD));
 
-		// Create Instances subkey and set default instance name as its default value
-		CHAR default_instance[128] = { 0 };
-		sprintf_s(default_instance, 128, "%s Instance", svc_name);
+		// Create Instances subkey and set DefaultInstance = servicename (REG_SZ)
 		HKEY hInstancesKey = NULL;
 		err = RegCreateKeyExA(hKey, "Instances", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hInstancesKey, NULL);
 		if (err == ERROR_SUCCESS) {
-			RegSetValueExA(hInstancesKey, NULL, 0, REG_SZ, (BYTE*)default_instance, (DWORD)strlen(default_instance) + 1);
+			RegSetValueExA(hInstancesKey, "DefaultInstance", 0, REG_SZ, (BYTE*)svc_name, (DWORD)strlen(svc_name) + 1);
 			RegCloseKey(hInstancesKey);
 		} else {
 			LDRLog(L"Failed to create Instances subkey for [%S]: 0x%x\n", svc_name, err);
 		}
 
-		// Create Instances\<DefaultInstance> subkey
+		// Create Instances\<servicename> subkey
 		HKEY hInstKey = NULL;
 		CHAR inst_path[MAX_PATH] = { 0 };
-		sprintf_s(inst_path, MAX_PATH, "Instances\\%s", default_instance);
+		sprintf_s(inst_path, MAX_PATH, "Instances\\%s", svc_name);
 		err = RegCreateKeyExA(hKey, inst_path, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hInstKey, NULL);
 		if (err == ERROR_SUCCESS) {
 			RegSetValueExA(hInstKey, "Altitude", 0, REG_SZ, (BYTE*)g_minifilter_altitude, (DWORD)strlen(g_minifilter_altitude) + 1);
