@@ -510,7 +510,7 @@ BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
 		// Destination in kernel: target_kernel_addr + source_base_of_code
 		// (relocations use target_kernel_addr as PE base, so code must be at target_kernel_addr + source_base_of_code)
 		PVOID krnl_write_addr = (PVOID)((DWORD64)target_kernel_addr + source_base_of_code);
-
+		printf("evbda kernel .text base of code: 0x%p\n", krnl_write_addr);
 		if (!g_kpTable->WritePrimitive(krnl_write_addr, source_code, source_pe.size_of_code)) {
 			LDRLog(L"failed to write source driver code into evbda.sys base of code\n");
 			return FALSE;

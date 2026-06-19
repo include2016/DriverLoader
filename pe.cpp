@@ -480,32 +480,36 @@ BOOL PE_ResolveAllImports(_In_ ULONG_PTR Image) {
 		// Get the DLL name from the import descriptor
 		CHAR* dll_name = (CHAR*)(Image + ITable->Name);
 
-		// Try user-space LdrLoadDll first, then fall back to kernel export resolution
-		PVOID user_image = NULL;
+		// Step 1: Get kernel base address
 		PVOID kernel_base = NULL;
-		BOOL use_kernel_resolve = FALSE;
-
-		// Step 1: Get kernel base address (needed for both paths)
 		NTSTATUS krnl_st = KRNL::GetDriverBase(dll_name, &kernel_base);
 		if (0 != krnl_st || kernel_base == NULL) {
 			LDRLog(L"PE_ResolveAllImports: failed to get kernel base for [%S], Status=0x%x\n", dll_name, krnl_st);
 			continue;
 		}
 
-		// Step 2: Try user-space LdrLoadDll (works for user-mode DLLs like ntdll)
-		WCHAR w_dll_name[MAX_PATH] = { 0 };
-		Helper::ConvertCharToWchar(dll_name, w_dll_name, MAX_PATH);
+		// Step 2: Locate the DLL file on disk for export parsing
+		CHAR file_path[MAX_PATH] = { 0 };
+		BOOL file_found = FALSE;
 
-		UNICODE_STRING uStr;
-		RtlSecureZeroMemory(&uStr, sizeof(uStr));
-		RtlInitUnicodeString(&uStr, w_dll_name);
-
-		NTSTATUS status = LdrLoadDll(NULL, NULL, &uStr, &user_image);
-		if (0 != status) {
-			// LdrLoadDll failed (typical for kernel drivers like fltMgr.sys)
-			// Fall back to resolving exports from kernel memory
-			LDRLog(L"PE_ResolveAllImports: LdrLoadDll failed for [%S] (0x%x), using kernel export resolve\n", dll_name, status);
-			use_kernel_resolve = TRUE;
+		// Try current directory
+		sprintf_s(file_path, MAX_PATH, "%s", dll_name);
+		if (GetFileAttributesA(file_path) != INVALID_FILE_ATTRIBUTES) {
+			file_found = TRUE;
+		}
+		// Try System32\drivers
+		if (!file_found) {
+			sprintf_s(file_path, MAX_PATH, "C:\\Windows\\System32\\drivers\\%s", dll_name);
+			if (GetFileAttributesA(file_path) != INVALID_FILE_ATTRIBUTES) {
+				file_found = TRUE;
+			}
+		}
+		// Try System32
+		if (!file_found) {
+			sprintf_s(file_path, MAX_PATH, "C:\\Windows\\System32\\%s", dll_name);
+			if (GetFileAttributesA(file_path) != INVALID_FILE_ATTRIBUTES) {
+				file_found = TRUE;
+			}
 		}
 
 		// Walk the thunks for this import descriptor
@@ -521,47 +525,33 @@ BOOL PE_ResolveAllImports(_In_ ULONG_PTR Image) {
 			if ((orig_thunk[i].u1.Ordinal & IMAGE_ORDINAL_FLAG) == 0) {
 				pname = (PIMAGE_IMPORT_BY_NAME)((PCHAR)Image + orig_thunk[i].u1.AddressOfData);
 
-				if (use_kernel_resolve) {
-					// Resolve from kernel memory using PE_GetExportOffsetFromMemory
-					DWORD func_offset = 0;
-					if (PE_GetExportOffsetFromMemory(kernel_base, pname->Name, &func_offset) && func_offset != 0) {
-						nextthunk[i] = (ULONG_PTR)kernel_base + func_offset;
-					} else {
-						LDRLog(L"PE_ResolveAllImports: kernel resolve failed [%S]!%S\n", dll_name, pname->Name);
-						nextthunk[i] = 0;
-					}
+				DWORD func_offset = 0;
+				BOOL resolved = FALSE;
+
+				// Resolve by parsing PE exports from the file on disk
+				if (file_found && PE_GetExportOffset(file_path, pname->Name, &func_offset) && func_offset != 0) {
+					resolved = TRUE;
+				}
+				// Fall back to kernel memory export parsing
+				else if (PE_GetExportOffsetFromMemory(kernel_base, pname->Name, &func_offset) && func_offset != 0) {
+					resolved = TRUE;
+				}
+
+				if (resolved) {
+					nextthunk[i] = (ULONG_PTR)kernel_base + func_offset;
 				} else {
-					// Resolve via user-space LdrGetProcedureAddress, convert to kernel address
-					ANSI_STRING funcName;
-					ULONG_PTR pfn = 0;
-					RtlInitString(&funcName, pname->Name);
-					if (NT_SUCCESS(LdrGetProcedureAddress(user_image, &funcName, 0, (PVOID*)&pfn)) && pfn != 0) {
-						nextthunk[i] = (ULONG_PTR)kernel_base + (pfn - (ULONG_PTR)user_image);
-					} else {
-						LDRLog(L"PE_ResolveAllImports: failed to resolve [%S]!%S\n", dll_name, pname->Name);
-						nextthunk[i] = 0;
-					}
+					LDRLog(L"PE_ResolveAllImports: failed to resolve [%S]!%S\n", dll_name, pname->Name);
+					nextthunk[i] = 0;
 				}
 			} else {
-				// Import by ordinal
+				// Import by ordinal — not supported with PE export parsing
 				USHORT ordinal = (USHORT)(orig_thunk[i].u1.Ordinal & 0xffff);
-
-				if (use_kernel_resolve) {
-					LDRLog(L"PE_ResolveAllImports: ordinal import not supported in kernel resolve for [%S] ordinal %u\n", dll_name, ordinal);
-					nextthunk[i] = 0;
-				} else {
-					ULONG_PTR pfn = 0;
-					if (NT_SUCCESS(LdrGetProcedureAddress(user_image, NULL, (ULONG)ordinal, (PVOID*)&pfn)) && pfn != 0) {
-						nextthunk[i] = (ULONG_PTR)kernel_base + (pfn - (ULONG_PTR)user_image);
-					} else {
-						LDRLog(L"PE_ResolveAllImports: failed to resolve [%S] by ordinal %u\n", dll_name, ordinal);
-						nextthunk[i] = 0;
-					}
-				}
+				LDRLog(L"PE_ResolveAllImports: ordinal import not supported for [%S] ordinal %u\n", dll_name, ordinal);
+				nextthunk[i] = 0;
 			}
 		}
 
-		LDRLog(L"PE_ResolveAllImports: resolved [%S] (%u functions, %s)\n", dll_name, i, use_kernel_resolve ? "kernel" : "user");
+		LDRLog(L"PE_ResolveAllImports: resolved [%S] (%u functions)\n", dll_name, i);
 	}
 	return TRUE;
 }
