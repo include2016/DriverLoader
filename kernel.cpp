@@ -79,6 +79,6 @@ namespace KRNL {
 		}
 
 		HeapFree(GetProcessHeap(), 0, buffer);
-		return (*DriverBaseAddress) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+		return STATUS_SUCCESS;
 	}
 }

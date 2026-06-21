@@ -534,6 +534,7 @@ BOOL PE_ResolveAllImports(_In_ ULONG_PTR Image) {
 				}
 				// Fall back to kernel memory export parsing
 				else if (PE_GetExportOffsetFromMemory(kernel_base, pname->Name, &func_offset) && func_offset != 0) {
+					LDRLog(L"failed to resolve export function from disk file \n");
 					resolved = TRUE;
 				}
 
