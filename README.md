@@ -1,3 +1,13 @@
+# 更新 2026-06-21
+
+现已支持对[UsermodeHookHelper](https://github.com/include2016/UserModeHookHelper/releases/tag/v1.1.2)主驱动的加载
+
+
+
+https://github.com/user-attachments/assets/5fdbe96c-b28e-421b-a70f-766f9cd3bf4f
+
+
+
 # DriverLoader / Windows DSE bypass
 
 利用漏洞驱动的内核读/写/执行原语，将 shellcode 注入目标内核驱动并劫持其执行流的框架。
