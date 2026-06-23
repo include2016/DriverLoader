@@ -37,8 +37,51 @@ typedef BOOL(*FnKpInitialize)(void);
 BOOL ReadConfig();
 VOID DriverCheck();
 BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize);
+BOOL EnableDebugPrivilege()
+{
+	HANDLE hToken = nullptr;
+	TOKEN_PRIVILEGES tp = { 0 };
+	LUID luid = { 0 };
 
+	if (!OpenProcessToken(
+		GetCurrentProcess(),
+		TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+		&hToken))
+	{
+		return FALSE;
+	}
+
+	if (!LookupPrivilegeValueW(
+		nullptr,
+		SE_DEBUG_NAME,
+		&luid))
+	{
+		CloseHandle(hToken);
+		return FALSE;
+	}
+
+	tp.PrivilegeCount = 1;
+	tp.Privileges[0].Luid = luid;
+	tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+	if (!AdjustTokenPrivileges(
+		hToken,
+		FALSE,
+		&tp,
+		sizeof(tp),
+		nullptr,
+		nullptr))
+	{
+		CloseHandle(hToken);
+		return FALSE;
+	}
+
+	CloseHandle(hToken);
+
+	return GetLastError() == ERROR_SUCCESS;
+}
 int main(int argc, char* argv[]) {
+	EnableDebugPrivilege();
 	volatile void* force_crt_strncpy = (void*)strncpy;
 	volatile void* force_crt_strncat = (void*)strncat;
 
