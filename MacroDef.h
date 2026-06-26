@@ -31,5 +31,7 @@
 #define NTKRNL_NAME "ntoskrnl.exe"
 #define DBG_EXPORT_FUNC "DbgPrompt"
 
+#define MINI_UNLOAD_EXPORT "MiniUnload"
+
 #define WIDEN2(x) L##x
 #define WIDEN(x) WIDEN2(x)

